@@ -653,18 +653,54 @@ const TEL = (() => {
     if (type === 'game_over' || type === 'bye' || type === 'feedback') flush(type);
   }
 
+  /* 上报端点：
+     · 同源部署（跑 playtest-server.mjs）时用相对路径
+     · 部署在 GitHub Pages 等静态托管时，必须指定一个能收 POST 的地址
+     用 ?api=https://xxx 覆盖，或直接改这里的默认值。 */
+  const API = q.get('api') || 'https://(tunnel-endpoint-removed)/api/log';
+  /* 本地暂存：上报失败（断网/隧道重启）时先攒在 localStorage，
+     下次打开同一页面再补发。否则玩家一断网，那一局数据就永远丢了。 */
+  const LS_KEY = 'pm_tel_queue_v1';
+
+  function post(batch) {
+    const body = JSON.stringify(batch);
+    return fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body, keepalive: true, mode: 'cors',
+    }).then((r) => r.ok).catch(() => false);
+  }
+
+  function drainQueue() {
+    let q2 = [];
+    try { q2 = JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch (e) { q2 = []; }
+    if (!q2.length) return;
+    let i = 0;
+    const step = () => {
+      if (i >= q2.length) { try { localStorage.removeItem(LS_KEY); } catch (e) {} return; }
+      post(q2[i]).then((ok) => {
+        if (!ok) { /* 还是失败，留在本地等下次 */
+          try { localStorage.setItem(LS_KEY, JSON.stringify(q2.slice(i))); } catch (e) {}
+          return;
+        }
+        i += 1; step();
+      });
+    };
+    step();
+  }
+
   function flush(reason) {
     if (silent || !buf.length) return;
-    const batch = buf.splice(0, buf.length);
-    const body = JSON.stringify({ pid, sid, ver, reason, records: batch });
-    try {
-      /* keepalive：让"关闭页面"时发出的请求也能送达 */
-      fetch('api/log', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body, keepalive: true,
-      }).catch(() => {});
-    } catch (e) { /* 忽略：上报失败不能影响游戏 */ }
+    const batch = { pid, sid, ver, reason, records: buf.splice(0, buf.length) };
+    post(batch).then((ok) => {
+      if (ok) return;
+      /* 发不出去 —— 暂存到本地，避免丢数据 */
+      try {
+        const prev = JSON.parse(localStorage.getItem(LS_KEY) || '[]');
+        prev.push(batch);
+        localStorage.setItem(LS_KEY, JSON.stringify(prev));
+      } catch (e) { /* 存储满/隐私模式：忽略 */ }
+    });
   }
 
   return {
@@ -717,6 +753,7 @@ TEL.boot({ collectTop: game.cfg.collectTop, spawnPerMove: game.cfg.spawnPerMove,
    否则 EV.OVER 会被订阅两次，结算时 onOver 跑两遍、
    数据里会出现两条重复的 game_over（实测踩过：两条相差 2ms）。
    原来这里是 bind() + layout() + refresh() 三连，改成 restart() 后必须去掉 bind() 和 refresh()。 */
+drainQueue();
 layout();
 restart();
 </script>
