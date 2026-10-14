@@ -717,6 +717,11 @@ const TEL = (() => {
     feedback: (k, v) => push('feedback', { key: k, val: v }),
     all: () => local,
     flush,
+    /* ★ drainQueue 必须导出：它是 IIFE 内部函数，
+       外面直接写 drainQueue() 会 ReferenceError，
+       而模块级异常会【静默终止后续所有语句】——
+       实测后果：layout() 和 restart() 都没跑，画面停在 300x150 空白画布。 */
+    drainQueue,
     pid, sid, ver,
   };
 })();
@@ -753,7 +758,7 @@ TEL.boot({ collectTop: game.cfg.collectTop, spawnPerMove: game.cfg.spawnPerMove,
    否则 EV.OVER 会被订阅两次，结算时 onOver 跑两遍、
    数据里会出现两条重复的 game_over（实测踩过：两条相差 2ms）。
    原来这里是 bind() + layout() + refresh() 三连，改成 restart() 后必须去掉 bind() 和 refresh()。 */
-drainQueue();
+TEL.drainQueue();
 layout();
 restart();
 </script>
