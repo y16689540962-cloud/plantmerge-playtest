@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>植物合成 · 试玩版</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: linear-gradient(180deg,#EAF7FF 0%,#F3FBEF 55%,#FFF9E8 100%);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    user-select: none;
+  }
+  #app { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; }
+  #hud { padding: 10px 0 4px; text-align: center; }
+  #score { font-size: 40px; font-weight: 800; color: #F2782C; line-height: 1.1; }
+  #top   { font-size: 17px; color: #5A7CA8; margin-top: 2px; }
+  #dex   { font-size: 15px; color: #2EA060; margin-top: 2px; min-height: 20px; }
+  #boardWrap { flex: 1; display: flex; align-items: center; justify-content: center; width: 100%; }
+  canvas { touch-action: none; display: block; }
+  #over {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(255,255,255,.82); backdrop-filter: blur(3px); z-index: 20;
+  }
+  #over .box { text-align: center; padding: 26px 30px; }
+  #over h2 { margin: 0 0 6px; font-size: 26px; color: #F2782C; }
+  #over p  { margin: 4px 0; color: #5A7CA8; font-size: 16px; }
+  #over button {
+    margin-top: 16px; padding: 13px 30px; font-size: 18px; font-weight: 700;
+    border: 0; border-radius: 999px; color: #fff; background: #2EA060; cursor: pointer;
+  }
+  /* 试玩对照用：右下角极小的规则标签，点一下循环切换 A/B */
+  #tag {
+    position: fixed; right: 6px; bottom: 6px; font-size: 10px; color: #9bb0c4;
+    background: rgba(255,255,255,.7); border-radius: 6px; padding: 3px 7px;
+    cursor: pointer; z-index: 30; user-select: none;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="hud">
+    <div id="score">0</div>
+    <div id="top">最高：种子</div>
+    <div id="dex"></div>
+  </div>
+  <div id="boardWrap"><canvas id="cv"></canvas></div>
+</div>
+<div id="over"><div class="box">
+  <h2>这一局结束了</h2>
+  <p id="overInfo"></p>
+  <button id="again">再来一局</button>
+</div></div>
+<div id="tag">规则 A</div>
+
+<script type="module">
+/* ===== 内联 core（与正式版同一份规则，勿在此另写逻辑） ===== */
+/**
+ * PlantMerge 核心玩法逻辑（引擎无关）
+ *
+ * 从已验证的 H5 原型移植。规则以 DEFAULT_CFG 为准。
+ *
+ * ⚠️ 历史数据订正（2026-10-14，见 experiments/PREREGISTRATION.md）：
+ *   本文件顶部曾写「贪心 723 步 / 随机 352 步」。这两个数已作废：
+ *     · 723 / 219 的**来源不明**，既非实测、也无法由公式推出
+ *       （H5 原型的 Math.ceil(25/spawnPerMove) 在 sp=2 只能得 13），按不可用处理；
+ *     · 「贪心」的旧模拟器没有还原棋盘，评估走法时就把局面走烂了，
+ *       每回合实际滑 5 次、只做约 24 次决策，与随机策略不可比。
+ *   修正后（N=300，统计有效步）：随机 117.7 步 / 贪心 219.4 步 / 启发式 314.9 步，
+ *   到 L8 比例 47% / 98% / 100%。玩法【有】策略深度，且技术差异明显。
+ *
+ * 本文件不引用任何 Cocos API，因此可以在 Node 里直接跑单元测试。
+ */
+export const PLANTS = [
+    { name: '种子', color: '#FFD93D', light: '#FFF3A8', dark: '#E0A800', shape: 'dot' },
+    { name: '发芽', color: '#7BE04A', light: '#C4F5A0', dark: '#4BA820', shape: 'sprout' },
+    { name: '幼苗', color: '#37C8F0', light: '#A8E9FA', dark: '#1591B8', shape: 'tri' },
+    { name: '花苞', color: '#C77DFF', light: '#EBC8FF', dark: '#8B3FD4', shape: 'flower' },
+    { name: '开花', color: '#FF6FB5', light: '#FFC2DE', dark: '#D43A85', shape: 'star' },
+    { name: '结果', color: '#FF5A3C', light: '#FFB3A0', dark: '#C42D14', shape: 'crown' },
+    { name: '果树', color: '#2ED47A', light: '#A8F5CE', dark: '#12925A', shape: 'diamond' },
+    { name: '森林', color: '#8A5CF6', light: '#D3BCFF', dark: '#5B2EC4', shape: 'star6' },
+];
+export const DEFAULT_CFG = {
+    size: 5,
+    kinds: 8,
+    fill: 0.45,
+    highChance: 0.15,
+    spawnOn: true,
+    spawnPerMove: 2, // 实测有效步约 118（随机）~220（贪心）；见文件头订正说明
+    collectTop: 'off', // 现状规则。改为 'first' 即启用"森林收进图鉴"
+};
+/** 事件名 */
+export const EV = {
+    MERGED: 'merged',
+    SPAWNED: 'spawned',
+    MOVED: 'moved',
+    OVER: 'over',
+    RESET: 'reset',
+    /** 满级植物被收进图鉴：{ r, c, level, index } —— index 是第几个（从 1 开始） */
+    COLLECTED: 'collected',
+};
+export class PlantMerge {
+    constructor(cfg = {}, rng = Math.random) {
+        this.grid = [];
+        this.score = 0;
+        this.topLevel = 1;
+        this.over = false;
+        this.moves = 0;
+        /** 已收进图鉴的满级植物数量 */
+        this.collected = 0;
+        this.listeners = new Map();
+        this.cfg = { ...DEFAULT_CFG, ...cfg };
+        this.rng = rng;
+        this.reset();
+    }
+    /* ---------- 事件 ---------- */
+    on(type, fn) {
+        if (!this.listeners.has(type))
+            this.listeners.set(type, []);
+        this.listeners.get(type).push(fn);
+        return this;
+    }
+    emit(type, payload) {
+        const arr = this.listeners.get(type);
+        if (arr)
+            for (const fn of arr)
+                fn(payload);
+    }
+    /* ---------- 重置 ---------- */
+    reset() {
+        const { size, fill } = this.cfg;
+        this.grid = [];
+        for (let r = 0; r < size; r++)
+            this.grid.push(new Array(size).fill(0));
+        this.score = 0;
+        this.topLevel = 1;
+        this.over = false;
+        this.moves = 0;
+        this.collected = 0;
+        for (let r = 0; r < size; r++)
+            for (let c = 0; c < size; c++)
+                if (this.rng() < fill)
+                    this.grid[r][c] = this.randLevel();
+        this.recomputeTop();
+        this.emit(EV.RESET);
+        return this;
+    }
+    randLevel() {
+        if (this.rng() < this.cfg.highChance)
+            return 1 + Math.floor(this.rng() * Math.min(3, this.cfg.kinds));
+        return 1;
+    }
+    recomputeTop() {
+        let top = 1;
+        const { size } = this.cfg;
+        for (let r = 0; r < size; r++)
+            for (let c = 0; c < size; c++)
+                if (this.grid[r][c] > top)
+                    top = this.grid[r][c];
+        this.topLevel = top;
+    }
+    occupied() {
+        let n = 0;
+        const { size } = this.cfg;
+        for (let r = 0; r < size; r++)
+            for (let c = 0; c < size; c++)
+                if (this.grid[r][c])
+                    n++;
+        return n;
+    }
+    hasEmpty() {
+        return this.occupied() < this.cfg.size * this.cfg.size;
+    }
+    /* ---------- 滑动：整片朝一个方向"压实"（2048 规则） ----------
+       踩过的坑，别再改错：
+       1) 不能用"相邻交换"式遍历 —— [1,1,0] 右滑时右边的 1 先滑进空格，
+          左边的 1 只会跟着滑，永远合不上。必须整条线抽取后合并。
+       2) 方向必须统一处理：一切转成"朝下标 0 压实"，其他方向靠反转输入/输出适配。
+          补零补错端会让方向整个反过来。 */
+    swipe(dr, dc) {
+        if (this.over)
+            return false;
+        if (dr === 0 && dc === 0)
+            return false;
+        const { size, kinds } = this.cfg;
+        const before = this.grid.map(row => row.slice());
+        const mergedAt = [];
+        const packLeft = (line) => {
+            const vals = line.filter(v => v !== 0);
+            const out = [];
+            const at = [];
+            const gains = [];
+            for (let i = 0; i < vals.length; i++) {
+                // 满级不再合成
+                if (i + 1 < vals.length && vals[i] === vals[i + 1] && vals[i] < kinds) {
+                    out.push(vals[i] + 1);
+                    at.push(out.length - 1);
+                    const gain = vals[i] * 10;
+                    gains.push(gain);
+                    this.score += gain;
+                    if (vals[i] + 1 > this.topLevel)
+                        this.topLevel = vals[i] + 1;
+                    i++;
+                }
+                else
+                    out.push(vals[i]);
+            }
+            while (out.length < size)
+                out.push(0);
+            return [out, at, gains];
+        };
+        const runLine = (read, write, reverse) => {
+            const raw = read();
+            const src = reverse ? raw.slice().reverse() : raw;
+            const [packed, at, gains] = packLeft(src);
+            const out = reverse ? packed.slice().reverse() : packed;
+            const target = reverse ? at.map(i => size - 1 - i) : at.slice();
+            /* gains 与 at 一一对应（gains[i] 是 at[i] 那一次合成的得分）。
+               注意：target 在反转时被映射成 size-1-i，但 gains 不跟着反转 ——
+               两者配对关系由调用方按 target[i] ↔ gains[i] 使用，顺序不受反转影响。
+               踩过的坑：改签名后漏传第三个参数，TS 直接报 TS2554；
+               若用宽松配置编译则会静默让 gain 变成 undefined，飘字永远不显示数字。 */
+            write(out, target, gains);
+        };
+        if (dc !== 0) {
+            for (let r = 0; r < size; r++) {
+                runLine(() => this.grid[r].slice(), (out, at, gains) => {
+                    for (let c = 0; c < size; c++)
+                        this.grid[r][c] = out[c];
+                    for (let i = 0; i < at.length; i++)
+                        mergedAt.push({ r, c: at[i], gain: gains[i] });
+                }, dc > 0 // packLeft 贴 index 0；右滑需反转
+                );
+            }
+        }
+        else {
+            for (let c = 0; c < size; c++) {
+                runLine(() => { const a = []; for (let r = 0; r < size; r++)
+                    a.push(this.grid[r][c]); return a; }, (out, at, gains) => {
+                    for (let r = 0; r < size; r++)
+                        this.grid[r][c] = out[r];
+                    for (let i = 0; i < at.length; i++)
+                        mergedAt.push({ r: at[i], c, gain: gains[i] });
+                }, dr > 0 // 下滑需反转
+                );
+            }
+        }
+        let moved = false;
+        for (let r = 0; r < size && !moved; r++)
+            for (let c = 0; c < size; c++)
+                if (this.grid[r][c] !== before[r][c]) {
+                    moved = true;
+                    break;
+                }
+        if (!moved) {
+            /* 无效滑动：把棋盘还原回去。
+               ★ 这里的 before 不是"撤销功能"，而是本次滑动是否产生位移的判定基准
+                 （含回滚副作用）。它必须保留 —— 撤销功能已整体移除，见文件末尾说明。 */
+            this.grid = before;
+            return false;
+        }
+        this.moves++;
+        for (const m of mergedAt)
+            this.emit(EV.MERGED, { r: m.r, c: m.c, level: this.grid[m.r][m.c], gain: m.gain });
+        this.collectTopLevel();
+        this.spawnAfterMove();
+        this.emit(EV.MOVED);
+        this.checkOver();
+        return true;
+    }
+    /* ---------- 满级收集（实验机制，默认关闭） ----------
+       动机：L8 不可再合成，合出来就变成【永久占格】。棋盘后期被满级植物挤满，
+       玩家会觉得"是系统把我挤死的"而不是"我做错了选择"。
+       收集后腾出格子，把 L8 从"障碍"变回"成就"。
+       为什么放在 MERGED 之后、SPAWNED 之前：
+         先让渲染层知道"这里刚合出了 L8"（可以放庆祝特效），
+         再收走。放在补块之前，收出的空格有可能立刻被新元素填上 —— 这是有意的，
+         否则"收集"就等于白送一个空位，会让局面明显变简单。 */
+    collectTopLevel() {
+        const mode = this.cfg.collectTop;
+        if (mode === 'off')
+            return 0;
+        const { size, kinds } = this.cfg;
+        let n = 0;
+        for (let r = 0; r < size; r++) {
+            for (let c = 0; c < size; c++) {
+                if (this.grid[r][c] !== kinds)
+                    continue;
+                if (mode === 'first' && this.collected >= 1)
+                    return n; // 只收首次
+                this.grid[r][c] = 0;
+                this.collected++;
+                n++;
+                this.emit(EV.COLLECTED, { r, c, level: kinds, index: this.collected });
+            }
+        }
+        return n;
+    }
+    /* ---------- 补块 ----------
+       为什么必须有：合成让元素总数 −1，升到 8 级需要 2^7 = 128 个 1 级元素，
+       不补块数学上永远升不到顶。
+       为什么"每步固定补 N 个"而不是"补到某占用率"：
+       占用率方案有致命漏洞 —— 补到 55% 就停，棋盘永远有空位，
+       结果【永远不会输】，随机乱滑都能满级。固定补块让元素单调增长。 */
+    spawnAfterMove() {
+        if (!this.cfg.spawnOn)
+            return 0;
+        const { size, spawnPerMove } = this.cfg;
+        const empties = [];
+        for (let r = 0; r < size; r++)
+            for (let c = 0; c < size; c++)
+                if (!this.grid[r][c])
+                    empties.push([r, c]);
+        if (!empties.length)
+            return 0;
+        const n = Math.min(spawnPerMove, empties.length);
+        for (let i = 0; i < n; i++) {
+            const k = Math.floor(this.rng() * empties.length);
+            const [r, c] = empties.splice(k, 1)[0];
+            this.grid[r][c] = this.randLevel();
+            this.emit(EV.SPAWNED, { r, c, level: this.grid[r][c] });
+        }
+        return n;
+    }
+    /* ---------- 可动性 ----------
+       这里踩过一个大坑：曾用「棋盘满 AND 无同级相邻」判负，
+       结果合成让占用骤降（13→9），产生互不相邻的高级孤岛，
+       棋盘远没满但四方向都滑不动 → 永久卡死。
+       也曾想改成「无同级相邻」就判负，但补块在滑动之后才发生，
+       补进来的低级元素经常能救活局面，过早判负会误杀本可继续的局。
+       正确：只要【有空格】或【有同级相邻】就还能玩。 */
+    hasAnyMove() {
+        const { size, kinds } = this.cfg;
+        for (let r = 0; r < size; r++) {
+            for (let c = 0; c < size; c++) {
+                const v = this.grid[r][c];
+                if (!v || v >= kinds)
+                    continue;
+                const nb = [[r - 1, c], [r + 1, c], [r, c - 1], [r, c + 1]];
+                for (const [nr, nc] of nb) {
+                    if (nr < 0 || nr >= size || nc < 0 || nc >= size)
+                        continue;
+                    if (this.grid[nr][nc] === v)
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+    canPlay() {
+        return this.hasEmpty() || this.hasAnyMove();
+    }
+    checkOver() {
+        if (this.over)
+            return;
+        if (this.canPlay())
+            return;
+        this.over = true;
+        this.emit(EV.OVER, { score: this.score, topLevel: this.topLevel, moves: this.moves });
+    }
+    /* ---------- 撤销：已整体移除（2026-10-14，按产品决策） ----------
+  
+       为什么删掉：
+         1) 休闲/亲子定位下，撤销会削弱失败的分量。而这款游戏当前最核心的
+            产品问题恰恰是"失败感不足、玩家觉得是系统把自己挤死的"——
+            再给一个"倒回去"的后门，等于把仅剩的决策重量也抵消掉。
+         2) 旧实现有 60 步上限（undoStack.length > 60 就 shift），
+            意味着长局里"能撤销多少步"是不确定的，玩家体验上不一致；
+            要么做无限撤销（内存与平衡都要重算），要么不做 —— 选择了不做。
+         3) revive()（广告复活）必须是不可撤销的：否则玩家"看广告复活 → 撤销"，
+            等于白嫖一次复活，激励视频的商业模型会被自己拆掉。
+            移除撤销栈之后，revive 天然不可回退，这条约束由结构保证而非靠约定。
+  
+       若将来确实要做"撤销/回退一步"，请重新引入并明确回答：
+         · 无限撤销还是限次？限几次？UI 上如何标注剩余次数？
+         · 复活之后是否允许继续撤销？（默认应为否）
+         · 撤销是否回退分数/图鉴计数？（旧实现回退，需保持一致性） */
+    /* ---------- 看广告续命：清掉最下面几行 ----------
+       注意：revive 会清空底部若干行并复位 over，此操作【不可撤销】——
+       撤销功能已移除（见上），因此不存在"复活后再倒回去"的路径。 */
+    revive(clearRows = 2) {
+        const { size } = this.cfg;
+        const keep = Math.max(3, size - clearRows);
+        for (let r = keep; r < size; r++)
+            for (let c = 0; c < size; c++)
+                this.grid[r][c] = 0;
+        this.over = false;
+        return this;
+    }
+    /** 遍历所有非空格子（供渲染层使用） */
+    cells() {
+        const { size } = this.cfg;
+        const out = [];
+        for (let r = 0; r < size; r++)
+            for (let c = 0; c < size; c++)
+                if (this.grid[r][c])
+                    out.push({ r, c, level: this.grid[r][c] });
+        return out;
+    }
+}
+
+
+/* ===== 试玩版渲染（刻意做得比正式版糙：试玩关心的是规则手感，不是美术） ===== */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const elScore = document.getElementById('score');
+const elTop = document.getElementById('top');
+const elDex = document.getElementById('dex');
+const elOver = document.getElementById('over');
+const elOverInfo = document.getElementById('overInfo');
+const elTag = document.getElementById('tag');
+
+const q = new URLSearchParams(location.search);
+let mode = q.get('collect') || 'off';
+let game = new PlantMerge({ collectTop: mode });
+
+let px = 0, cell = 0, ox = 0, oy = 0;
+
+function layout() {
+  const wrap = document.getElementById('boardWrap');
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  const s = Math.min(w, h) - 16;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(s * dpr); cv.height = Math.round(s * dpr);
+  cv.style.width = s + 'px'; cv.style.height = s + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  px = s; cell = s / game.cfg.size; ox = 0; oy = 0;
+  draw();
+}
+window.addEventListener('resize', layout);
+
+/* 简单的坐标换算：canvas 内部坐标（左上原点）←→ 格子 */
+function cellAt(x, y) {
+  const c = Math.floor((x - ox) / cell), r = Math.floor((y - oy) / cell);
+  if (r < 0 || c < 0 || r >= game.cfg.size || c >= game.cfg.size) return null;
+  return { r, c };
+}
+
+const D = 0.5;   // 圆角比例
+function draw() {
+  const n = game.cfg.size;
+  ctx.clearRect(0, 0, px, px);
+  // 底板
+  ctx.fillStyle = '#ffffff';
+  ctx.globalAlpha = .55;
+  ctx.fillRect(0, 0, px, px);
+  ctx.globalAlpha = 1;
+
+  for (let r = 0; r < n; r++) {
+    for (let c = 0; c < n; c++) {
+      const x = ox + c * cell, y = oy + r * cell;
+      const v = game.grid[r][c];
+      // 空格底
+      ctx.fillStyle = '#E8F1F8';
+      roundRect(x + 3, y + 3, cell - 6, cell - 6, cell * .18);
+      ctx.fill();
+      if (!v) continue;
+      const p = PLANTS[v - 1];
+      ctx.fillStyle = p.color;
+      roundRect(x + 5, y + 5, cell - 10, cell - 10, cell * .22);
+      ctx.fill();
+      // 高光
+      ctx.fillStyle = p.light;
+      ctx.globalAlpha = .55;
+      roundRect(x + 5 + cell * .12, y + 5 + cell * .1, cell * .34, cell * .2, cell * .1);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      // 文字：用名字而不是数字，更接近正式版的"看形状"体验
+      ctx.fillStyle = '#fff';
+      ctx.font = `700 ${Math.round(cell * .3)}px -apple-system, "PingFang SC", sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(p.name, x + cell / 2, y + cell / 2);
+      // 左上角小等级数字，方便试玩者描述"我在第几级"
+      ctx.fillStyle = 'rgba(0,0,0,.35)';
+      ctx.font = `700 ${Math.round(cell * .19)}px sans-serif`;
+      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      ctx.fillText(String(v), x + 9, y + 8);
+    }
+  }
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function refresh() {
+  elScore.textContent = game.score;
+  const lv = Math.min(game.topLevel, PLANTS.length);
+  elTop.textContent = '最高：' + PLANTS[lv - 1].name;
+  const on = game.cfg.collectTop !== 'off';
+  elDex.textContent = on ? `图鉴 森林 ×${game.collected}` : '';
+  elTag.textContent = game.cfg.collectTop === 'off' ? '规则 A'
+                    : game.cfg.collectTop === 'first' ? '规则 B' : '规则 B2';
+}
+
+function onOver() {
+  elOverInfo.textContent = `得分 ${game.score} · 最高 ${PLANTS[Math.min(game.topLevel,8)-1].name}`
+    + (game.cfg.collectTop !== 'off' ? ` · 图鉴森林 ×${game.collected}` : '');
+  elOver.style.display = 'flex';
+  /* 每局结束立刻上报。用 setTimeout(0) 让结算面板先渲染出来，
+     避免上报逻辑（哪怕是异步的）拖慢玩家看到结果的时机。 */
+  const secs = Math.round((Date.now() - gameStartAt) / 1000);
+  setTimeout(() => TEL.gameOver(game, gameNo, reachedL8ThisGame, secs), 0);
+}
+document.getElementById('again').onclick = () => {
+  elOver.style.display = 'none';
+  /* ★ 这是"想继续玩"最硬的证据：玩家主动点了再来一局。 */
+  TEL.again(gameNo);
+  restart();
+};
+
+/* 每次开新局时重置本局统计 */
+let gameNo = 0;
+let gameStartAt = Date.now();
+let reachedL8ThisGame = false;
+
+function restart(m) {
+  if (m) mode = m;
+  game = new PlantMerge({ collectTop: mode });
+  gameNo += 1;
+  gameStartAt = Date.now();
+  reachedL8ThisGame = false;
+  TEL.gameStart(gameNo);
+  bind(); refresh(); draw();
+}
+function bind() {
+  game.on(EV.MERGED, (p) => {
+    if (p.level >= 8) reachedL8ThisGame = true;
+    refresh();
+  });
+  game.on(EV.SPAWNED, refresh);
+  game.on(EV.COLLECTED, (p) => { refresh(); flash(p); });
+  game.on(EV.OVER, () => { refresh(); onOver(); });
+  game.on(EV.RESET, refresh);
+}
+
+/* 玩家离开时上报一次，用于区分"玩到最后走了"和"玩到一半就走了"。
+   visibilitychange 比 beforeunload 可靠（移动端浏览器常常不发 unload）。 */
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') TEL.flush('hidden');
+});
+window.addEventListener('pagehide', () => TEL.bye());
+
+/* 收集/合成的简单反馈（试玩版不追求特效，只要玩家知道发生了） */
+let flashes = [];
+function flash(p) { flashes.push({ r: p.r, c: p.c, t: 1 }); }
+function tick() {
+  if (flashes.length) {
+    const n = game.cfg.size;
+    for (const f of flashes) {
+      const a = f.t;
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.strokeStyle = '#2EA060'; ctx.lineWidth = 6;
+      roundRect(ox + f.c * cell + 4, oy + f.r * cell + 4, cell - 8, cell - 8, cell * .2);
+      ctx.stroke();
+      ctx.restore();
+      f.t -= 0.04;
+    }
+    flashes = flashes.filter((f) => f.t > 0);
+    if (flashes.length) requestAnimationFrame(tick);
+  }
+}
+
+/* ===== 触摸滑动 ===== */
+let sx = 0, sy = 0, done = false;
+function start(x, y) { sx = x; sy = y; done = false; }
+function move(x, y) {
+  if (done) return;
+  const dx = x - sx, dy = y - sy;
+  const th = Math.min(px * 0.18, 70);
+  if (Math.hypot(dx, dy) < th) return;
+  done = true;
+  let ok;
+  if (Math.abs(dx) > Math.abs(dy)) ok = game.swipe(0, dx > 0 ? 1 : -1);
+  else ok = game.swipe(dy > 0 ? 1 : -1, 0);
+  refresh(); draw();
+}
+cv.addEventListener('touchstart', (e) => { const t = e.touches[0]; start(t.clientX, t.clientY); e.preventDefault(); }, { passive: false });
+cv.addEventListener('touchmove',  (e) => { const t = e.touches[0]; move(t.clientX, t.clientY); e.preventDefault(); }, { passive: false });
+cv.addEventListener('touchend',   (e) => e.preventDefault(), { passive: false });
+
+cv.addEventListener('mousedown', (e) => start(e.clientX, e.clientY));
+window.addEventListener('mousemove', (e) => move(e.clientX, e.clientY));
+window.addEventListener('mouseup', () => { done = true; });
+cv.addEventListener('click', (e) => { start(e.clientX, e.clientY); });
+
+/* 键盘：方向键也能玩（方便在电脑上快速试） */
+window.addEventListener('keydown', (e) => {
+  const m = { ArrowLeft: [0,-1], ArrowRight: [0,1], ArrowUp: [-1,0], ArrowDown: [1,0] }[e.key];
+  if (!m) return;
+  e.preventDefault();
+  game.swipe(m[0], m[1]); refresh(); draw();
+});
+
+/* 右下角标签：点一下在 A / B / B2 之间循环（试玩对照用） */
+elTag.onclick = () => {
+  const next = game.cfg.collectTop === 'off' ? 'first'
+             : game.cfg.collectTop === 'first' ? 'all' : 'off';
+  restart(next);
+};
+
+/* ============================================================================
+   真人试玩数据采集
+   ============================================================================
+   设计原则（这几条决定了数据有没有用）：
+
+   1) 【记录行为，不只记录答案】
+      GPT 要验证的核心是"失败是否公平""是否想再来一局"。
+      问玩家"你觉得公平吗"，得到的是他的自我叙述；
+      而他【实际有没有再开一局】无法伪装。
+      两者都记，但行为数据权重更高。
+
+   2) 【每局结束立刻上报】
+      玩家随时可能关页面，不能等玩完再统一上报 —— 否则统计只覆盖"玩到最后的人"，
+      而那部分人本身就是幸存者偏差。
+
+   3) 【上报尽力而为，绝不阻塞游戏】
+      fetch 失败就当没发生。绝不能因为网络问题让玩家玩不了。
+
+   4) 【不采集个人信息】
+      只存匿名 sid/pid；不存完整 IP（服务端只留前两段）、不存输入内容。
+   ============================================================================ */
+const TEL = (() => {
+  const q = new URLSearchParams(location.search);
+  /* 玩家编号：组织者预先分配（?p=A1），用于把数据对应到人、便于回访追问。
+     没给就随机生成。 */
+  const pid = q.get('p') || ('anon-' + Math.random().toString(36).slice(2, 6));
+  const sid = 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  /* 版本标记：记录这个人先玩的是哪个版本（用于 A/B 顺序分析） */
+  const ver = q.get('v') || 'na';
+  /* silent=1 时不上报 —— 我自己测试时用，避免污染真实数据 */
+  const silent = q.get('silent') === '1';
+
+  const buf = [];
+  const local = [];
+
+  function push(type, extra) {
+    const rec = {
+      type, pid, sid, ver, silent,
+      t: Math.round(performance.now()),
+      ...extra,
+    };
+    local.push(rec);
+    if (!silent) buf.push(rec);
+    if (type === 'game_over' || type === 'bye' || type === 'feedback') flush(type);
+  }
+
+  function flush(reason) {
+    if (silent || !buf.length) return;
+    const batch = buf.splice(0, buf.length);
+    const body = JSON.stringify({ pid, sid, ver, reason, records: batch });
+    try {
+      /* keepalive：让"关闭页面"时发出的请求也能送达 */
+      fetch('api/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body, keepalive: true,
+      }).catch(() => {});
+    } catch (e) { /* 忽略：上报失败不能影响游戏 */ }
+  }
+
+  return {
+    boot: (cfg) => push('boot', { cfg }),
+    gameStart: (gameNo) => push('game_start', { gameNo }),
+    /* 每局结束 —— 最核心的一条 */
+    gameOver: (g, gameNo, reachedL8, secs) => push('game_over', {
+      gameNo, score: g.score, moves: g.moves, topLevel: g.topLevel,
+      collected: g.collected, collectTop: g.cfg.collectTop, reachedL8, secs,
+    }),
+    /* 点了「再来一局」—— "想继续玩"最硬的证据 */
+    again: (gameNo) => push('again', { gameNo }),
+    bye: () => push('bye', {}),
+    feedback: (k, v) => push('feedback', { key: k, val: v }),
+    all: () => local,
+    flush,
+    pid, sid, ver,
+  };
+})();
+window.__tel = TEL;
+
+/* 给主试玩人（我）用的控制台接口 */
+window.__plantMerge = {
+  restart,
+  collect: (m) => { restart(m); return m; },
+  state: () => ({ collectTop: game.cfg.collectTop, collected: game.collected, score: game.score, moves: game.moves, topLevel: game.topLevel, over: game.over }),
+  /* 交叉验证专用：在【浏览器里】用与 Node 模拟完全相同的随机策略跑一局。
+     目的：证明"页面上的玩法"和"离线模拟的玩法"是同一套规则。
+     若两边数字对不上，说明有人改了其中一份而没同步 —— 那样所有平衡数据都作废。 */
+  simOne: (seed, modeKind, spawnPerMove) => {
+    const rng = (s => () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; })(seed >>> 0);
+    const g = new PlantMerge({ collectTop: modeKind || 'off', spawnPerMove: spawnPerMove || 2 }, rng);
+    const dirs = [[-1,0],[1,0],[0,-1],[0,1]];
+    let n = 0;
+    while (!g.over && n < 100000) {
+      const d = dirs[Math.floor(g.rng() * 4)];
+      g.swipe(d[0], d[1]); n++;
+    }
+    return { seed, moves: g.moves, score: g.score, topLevel: g.topLevel, collected: g.collected, over: g.over, swipes: n };
+  },
+  tel: TEL,
+  dump: () => JSON.stringify(TEL.all(), null, 1),
+};
+
+/* 开局：上报一次环境信息（只报配置，不报设备明细） */
+TEL.boot({ collectTop: game.cfg.collectTop, spawnPerMove: game.cfg.spawnPerMove, size: game.cfg.size, kinds: game.cfg.kinds });
+
+/* ★ 首次进入算第 1 局。
+   注意 restart() 内部已经调用了 bind()，所以这里【不能】再调一次 bind ——
+   否则 EV.OVER 会被订阅两次，结算时 onOver 跑两遍、
+   数据里会出现两条重复的 game_over（实测踩过：两条相差 2ms）。
+   原来这里是 bind() + layout() + refresh() 三连，改成 restart() 后必须去掉 bind() 和 refresh()。 */
+layout();
+restart();
+</script>
+</body>
+</html>
